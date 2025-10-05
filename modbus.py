@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Seltron WDC <-> Modbus TCP TRANSPARENT PROXY (ACTIVE, ASCII-only) z vrsto zahtev, cache TTL in de-dupe branj
+Seltron WDC <-> Modbus TCP TRANSPARENT PROXY (ACTIVE, ASCII-only)
+z vrsto zahtev, cache TTL in de-dupe branj
 
 - WDC je MASTER na RS-232 (Modbus ASCII, 9600-N-8-1; Seltron EXT).
 - Ta skripta je SCADA SLAVE s fiksnim UNIT_ID = 128 in pretvarja TCP READ/WRITE
   v EXT (phase-1 + phase-2). Node-RED/HA uporablja enake naslove kot WDC.
 
 Optimizacije proti timeoutom:
-  • Serve-from-cache (TTL): če je blok svež (npr. <5 s), vrnemo takoj.
-  • De-duplication: več vzporednih enakih branj (start, qty) deli isti pending req.
+• Serve-from-cache (TTL): če je blok svež (npr. <5 s), vrnemo takoj.
+• De-duplication: več vzporednih enakih branj (start, qty) deli isti pending req.
 
-Odvisnosti:
-  pip3 install pyserial pymodbus==3.6.6
+Odvisnosti:  pip3 install pyserial pymodbus==3.6.6
 """
 
 import sys, time, threading, serial, re, argparse
@@ -21,21 +22,30 @@ from typing import List, Optional, Deque, Tuple, Dict
 from collections import deque
 
 # =================== PRIVZETE NASTAVITVE ===================
-UNIT_ID      = 0x80      # FIKSNO: 128 (SCADA)
-EXT_BASE     = 0x1000    # EXT okno (faza-1)
-SERIAL_BAUD  = 9600
-TCP_BIND     = "0.0.0.0"
-IMAGE_SIZE   = 8192
+
+UNIT_ID     = 0x80     # FIKSNO: 128 (SCADA)
+EXT_BASE    = 0x1000   # EXT okno (faza-1)
+SERIAL_BAUD = 9600
+TCP_BIND    = "0.0.0.0"
+IMAGE_SIZE  = 8192
+
+# Prijaznost do WDC EXT cikla
+MAX_QTY_PER_REQ               = 12    # maksimalno št. registrov v enem branju
+CHUNK_GAP_SEC                 = 0.03  # pavza med "kosi" branja (30 ms)
+EXT_QUIET_AFTER_PHASE1_SEC    = 0.40  # "tišina" po phase-1, da WDC odda phase-2
+POST_WRITE_SETTLE_SEC         = 0.20  # mirovanje po uspešnem write
 
 # =================== GLOBALNO STANJE ===================
-image:   List[int] = [0]*IMAGE_SIZE           # zadnje znane vrednosti
-last_ts: List[float] = [0.0]*IMAGE_SIZE       # timestamp posodobitve vsakega registra
-outbox:  List[int] = [0]*IMAGE_SIZE           # write buffer
+
+image: List[int]    = [0] * IMAGE_SIZE   # zadnje znane vrednosti
+last_ts: List[float]= [0.0] * IMAGE_SIZE # timestamp posodobitve vsakega registra
+outbox: List[int]   = [0] * IMAGE_SIZE   # write buffer
+
 image_lock = threading.Lock()
 
 @dataclass
 class Req:
-    op: str                    # "read" ali "write"
+    op: str                # "read" ali "write"
     start: int
     qty: int
     values: Optional[List[int]] = None
@@ -44,13 +54,14 @@ class Req:
     cond: threading.Condition = field(default_factory=lambda: threading.Condition())
 
 # Vrsta, trenutno aktivna, in de-dupe mapa
-queue_lock   = threading.Lock()
-queue_cond   = threading.Condition(queue_lock)
+queue_lock = threading.Lock()
+queue_cond = threading.Condition(queue_lock)
 req_queue: Deque[Req] = deque()
 current_req: Optional[Req] = None
-pending_reads: Dict[Tuple[int,int], Req] = {}   # (start,qty) -> Req, za de-dupe
+pending_reads: Dict[Tuple[int,int], Req] = {}  # (start,qty) -> Req, za de-dupe
 
 # =================== POMOŽNE ===================
+
 HEX_RE = re.compile(br'^[0-9A-Fa-f]+$')
 
 def clamp16(x: int) -> int:
@@ -60,6 +71,7 @@ def hexdump(b: bytes) -> str:
     return ' '.join(f'{x:02X}' for x in b)
 
 # ------------------- ASCII utili -------------------
+
 def lrc(payload: bytes) -> int:
     s = 0
     for b in payload:
@@ -84,16 +96,21 @@ def ascii_parse(frame: bytes) -> Tuple[int,int,bytes]:
     return raw[0], raw[1], raw[2:-1]
 
 # =================== RS232 SLAVE (ASCII-only) ===================
+
 class SeltronExtSlave(threading.Thread):
     def __init__(self, port: str, debug: bool):
         super().__init__(daemon=True)
         self.ser = serial.Serial(
-            port=port, baudrate=SERIAL_BAUD,
-            bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE, timeout=0.05,
+            port=port,
+            baudrate=SERIAL_BAUD,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.05,
         )
         self.rx_buf = b""
         self.debug = debug
+        self.quiet_until = 0.0  # tišina za backoff po phase-1
 
     def run(self):
         while True:
@@ -103,34 +120,34 @@ class SeltronExtSlave(threading.Thread):
                     self.rx_buf += chunk
                     if len(self.rx_buf) > 16384:
                         self.rx_buf = self.rx_buf[-4096:]
-
-                    while True:
-                        i = self.rx_buf.find(b':')
-                        if i < 0:
-                            self.rx_buf = b""  # počisti šum pred ':'
-                            break
-                        if i > 0:
-                            self.rx_buf = self.rx_buf[i:]
-                        j = self.rx_buf.find(b'\r\n')
-                        if j < 0:
-                            break
-
-                        frame = self.rx_buf[:j+2]
-                        self.rx_buf = self.rx_buf[j+2:]
-
-                        try:
-                            addr, fn, body = ascii_parse(frame)
-                        except Exception:
-                            continue
-
-                        if addr == UNIT_ID:
-                            self._handle_pdu(fn, body)
-
+                while True:
+                    i = self.rx_buf.find(b':')
+                    if i < 0:
+                        self.rx_buf = b""  # počisti šum pred ':'
+                        break
+                    if i > 0:
+                        self.rx_buf = self.rx_buf[i:]
+                    j = self.rx_buf.find(b'\r\n')
+                    if j < 0:
+                        break
+                    frame = self.rx_buf[:j+2]
+                    self.rx_buf = self.rx_buf[j+2:]
+                    try:
+                        addr, fn, body = ascii_parse(frame)
+                    except Exception:
+                        continue
+                    if addr == UNIT_ID:
+                        self._handle_pdu(fn, body)
             except Exception as e:
                 print(f"[SER] Error: {e}", file=sys.stderr)
                 time.sleep(0.05)
 
     def _send(self, fn: int, body: bytes):
+        # spoštuj "tišino" po phase-1
+        now = time.monotonic()
+        if now < self.quiet_until:
+            time.sleep(self.quiet_until - now)
+
         pkt = ascii_build(UNIT_ID, fn, body)
         if self.debug:
             print(f"[TX] {hexdump(pkt)}")
@@ -138,6 +155,7 @@ class SeltronExtSlave(threading.Thread):
 
     def _handle_pdu(self, fn: int, body: bytes):
         global current_req
+
         # ---------- EXT phase-1 ----------
         if fn == 0x03 and len(body) == 4:
             start = (body[0] << 8) | body[1]
@@ -149,6 +167,10 @@ class SeltronExtSlave(threading.Thread):
                     req = current_req
                 if self.debug:
                     print("[SER] EXT phase-1 from WDC")
+
+                # nastavi backoff "tišino" – da WDC lahko odda phase-2
+                self.quiet_until = time.monotonic() + EXT_QUIET_AFTER_PHASE1_SEC
+
                 if not req:
                     EXTFU, EXTADDR, EXTNOREG = 0x10, 0x0000, 0x0000
                 else:
@@ -156,6 +178,7 @@ class SeltronExtSlave(threading.Thread):
                         EXTFU, EXTADDR, EXTNOREG = 0x10, req.start, req.qty
                     else:  # write
                         EXTFU, EXTADDR, EXTNOREG = 0x03, req.start, req.qty
+
                 payload = bytes([
                     6,
                     (EXTFU>>8)&0xFF, EXTFU&0xFF,
@@ -171,23 +194,27 @@ class SeltronExtSlave(threading.Thread):
             if req and req.op == "write" and start == req.start and qty == req.qty:
                 with image_lock:
                     vals = outbox[start:start+qty]
-                resp = bytes([qty*2]) + b''.join(bytes([(v>>8)&0xFF, v&0xFF]) for v in vals)
+                    resp = bytes([qty*2]) + b''.join(bytes([(v>>8)&0xFF, v&0xFF]) for v in vals)
                 self._send(0x03, resp)
+
                 # finish write
                 with req.cond:
                     req.done = True
                     req.cond.notify_all()
+
+                # osveži image/last_ts
                 with queue_lock:
                     with image_lock:
                         now = time.monotonic()
-                        for i,v in enumerate(vals):
-                            idx = start+i
+                        for i, v in enumerate(vals):
+                            idx = start + i
                             if idx < IMAGE_SIZE:
                                 image[idx] = clamp16(v)
                                 last_ts[idx] = now
-                    current_req = None
+                        # končaj current_req
+                        current_req = None
+
                 return
-            return
 
         # ---------- READ phase-2: WDC z 0x10 piše rezultate ----------
         if fn == 0x10 and len(body) >= 5:
@@ -195,19 +222,28 @@ class SeltronExtSlave(threading.Thread):
             qty   = (body[2] << 8) | body[3]
             bc    = body[4]
             if bc == qty*2 and len(body) == 5+bc:
-                vals = [ (body[5+2*i] << 8) | body[5+2*i+1] for i in range(qty) ]
-                now  = time.monotonic()
+                vals = [
+                    (body[5+2*i] << 8) | body[5+2*i+1]
+                    for i in range(qty)
+                ]
+                now = time.monotonic()
                 with image_lock:
-                    for i,v in enumerate(vals):
-                        idx = start+i
+                    for i, v in enumerate(vals):
+                        idx = start + i
                         if idx < IMAGE_SIZE:
                             image[idx] = clamp16(v)
                             last_ts[idx] = now
+
                 if self.debug:
                     print(f"[SER] EXT phase-2 values start={start} qty={qty}")
+
                 # ACK
-                ack = bytes([(start>>8)&0xFF, start&0xFF, (qty>>8)&0xFF, qty&0xFF])
+                ack = bytes([
+                    (start>>8)&0xFF, start&0xFF,
+                    (qty>>8)&0xFF,   qty&0xFF
+                ])
                 self._send(0x10, ack)
+
                 # zaključek READ pendinga
                 with queue_lock:
                     req = current_req
@@ -221,6 +257,7 @@ class SeltronExtSlave(threading.Thread):
                 return
 
 # =================== Modbus TCP ===================
+
 from pymodbus.server import StartTcpServer
 from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
 from pymodbus.datastore.store import BaseModbusDataBlock
@@ -230,7 +267,7 @@ class ProxyDataBlock(BaseModbusDataBlock):
     def __init__(self, timeout_sec: float, cache_ttl: float):
         super().__init__()
         self.timeout_sec = timeout_sec
-        self.cache_ttl = cache_ttl
+        self.cache_ttl   = cache_ttl
 
     def validate(self, address, count=1):
         start = int(address); end = start + int(count)
@@ -255,6 +292,7 @@ class ProxyDataBlock(BaseModbusDataBlock):
                         req_queue.remove(req)
                 except ValueError:
                     pass
+            # za write pustimo exception (caller ga ne more nadomestiti s "stale")
             raise RuntimeError("Timeout waiting WDC (no EXT phase-2)")
 
     def _read_from_cache(self, start: int, qty: int) -> Optional[List[int]]:
@@ -266,15 +304,14 @@ class ProxyDataBlock(BaseModbusDataBlock):
                     return None
             return [image[start+i] for i in range(qty)]
 
-    def getValues(self, address, count=1):
-        start = int(address); qty = int(count)
-
+    # --- NOVO: en-cikel branje z de-dupe in timeout -> None ---
+    def _blocking_read_once(self, start: int, qty: int) -> Optional[List[int]]:
         # 1) poskusi iz cache-a
         cached = self._read_from_cache(start, qty)
         if cached is not None:
             return cached
 
-        # 2) de-dupe: če že obstaja pending za isti (start,qty), čakaj nanj
+        # 2) de-dupe + enqueue
         key = (start, qty)
         with queue_lock:
             existing = pending_reads.get(key)
@@ -286,7 +323,7 @@ class ProxyDataBlock(BaseModbusDataBlock):
                 req_queue.append(req)
                 queue_cond.notify_all()
 
-        # 3) počakaj na dokončanje (ali timeout)
+        # 3) počakaj (ali timeout)
         end_by = time.monotonic() + self.timeout_sec
         with req.cond:
             while not req.done and req.error is None:
@@ -295,57 +332,88 @@ class ProxyDataBlock(BaseModbusDataBlock):
                     break
                 req.cond.wait(remaining)
 
-        # 4) če je to bil “prvotni” req in ni uspel, odstrani iz mape
+        # 4) očisti pending, če se ni izšlo
         with queue_lock:
             if pending_reads.get(key) is req and not req.done:
                 pending_reads.pop(key, None)
 
         if not req.done:
-            raise RuntimeError("Timeout waiting WDC (no EXT phase-2)")
+            return None
 
-        # 5) vrni iz cache-a
-        cached2 = self._read_from_cache(start, qty)
-        if cached2 is None:
-            # v teoriji ne bi smelo, ampak za vsak slučaj
+        # 5) vrni iz cache-a (po phase-2 je napolnjen)
+        return self._read_from_cache(start, qty)
+
+    def getValues(self, address, count=1):
+        start = int(address)
+        total_qty = int(count)
+
+        # majhna branja -> 1 klic
+        if total_qty <= MAX_QTY_PER_REQ:
+            vals = self._blocking_read_once(start, total_qty)
+            if vals is not None:
+                return vals
+            # timeout: vrni zadnje znane vrednosti
             with image_lock:
-                return [image[start+i] for i in range(qty)]
-        return cached2
+                return [image[start+i] for i in range(total_qty)]
+
+        # velika branja -> razdrobi na kose
+        out: List[int] = []
+        done = 0
+        while done < total_qty:
+            chunk_qty   = min(MAX_QTY_PER_REQ, total_qty - done)
+            chunk_start = start + done
+            vals = self._blocking_read_once(chunk_start, chunk_qty)
+            if vals is None:
+                # timeout na chunku -> uporabi zadnje znane vrednosti
+                with image_lock:
+                    vals = [image[chunk_start+i] for i in range(chunk_qty)]
+            out.extend(vals)
+            done += chunk_qty
+            time.sleep(CHUNK_GAP_SEC)  # inter-chunk gap
+        return out
 
     def setValues(self, address, values):
         if isinstance(values, int):
             values = [values]
         vals  = [clamp16(int(v)) for v in values]
-        start = int(address); qty = len(vals)
+        start = int(address)
+        qty   = len(vals)
 
         # outbox napolnimo vnaprej
         with image_lock:
-            for i,v in enumerate(vals):
-                idx = start+i
+            for i, v in enumerate(vals):
+                idx = start + i
                 if idx < IMAGE_SIZE:
                     outbox[idx] = v
 
         # write nima smisla de-dupat; vsak je lahko drugačen
         req = Req(op="write", start=start, qty=qty, values=vals)
         self._enqueue_and_wait(req)
-        # image se posodobi v handlerju
+
+        # omogoči WDC-ju, da nadaljuje EXT cikel
+        time.sleep(POST_WRITE_SETTLE_SEC)
 
 def run_tcp(timeout_sec: float, tcp_port: int, cache_ttl: float):
     block   = ProxyDataBlock(timeout_sec, cache_ttl)
     store   = ModbusSlaveContext(hr=block, zero_mode=True)
     context = ModbusServerContext(slaves=store, single=True)
+
     identity = ModbusDeviceIdentification()
-    identity.VendorName  = "Seltron-Ext-Proxy"
+    identity.VendorName = "Seltron-Ext-Proxy"
     identity.ProductCode = "WDC-PROXY"
-    identity.VendorUrl   = "local"
+    identity.VendorUrl = "local"
     identity.ProductName = "WDC RS232 (ASCII) <-> Modbus TCP Transparent Proxy"
-    identity.ModelName   = "EXT-Translator [unit=128, cache+dedupe]"
-    identity.MajorMinorRevision = "3.0"
+    identity.ModelName = "EXT-Translator [unit=128, cache+dedupe+chunk]"
+    identity.MajorMinorRevision = "3.1"
+
     StartTcpServer(context=context, identity=identity, address=(TCP_BIND, tcp_port))
 
 # =================== MAIN ===================
+
 def main():
     ap = argparse.ArgumentParser(description="Seltron WDC <-> Modbus TCP Proxy (ASCII-only, unit=128)")
-    ap.add_argument("--serial", default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AE01KJE4-if00-port0",
+    ap.add_argument("--serial",
+                    default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AE01KJE4-if00-port0",
                     help="RS232 port pot")
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="TCP zahtevek timeout (s) za EXT fazo-2")
@@ -353,11 +421,16 @@ def main():
                     help="koliko dolgo se šteje blok kot svež (s)")
     ap.add_argument("--tcp-port", type=int, default=5020,
                     help="TCP port (privzeto 5020)")
-    ap.add_argument("--debug", action="store_true", help="izpisi EXT faze in TX hexdump")
+    ap.add_argument("--debug", action="store_true",
+                    help="izpisi EXT faze in TX hexdump")
     args = ap.parse_args()
 
-    print(f"[INFO] Transparent proxy up (ASCII-only). Serial: {args.serial} UNIT_ID={UNIT_ID}; "
-          f"TCP: {TCP_BIND}:{args.tcp_port}; TIMEOUT={args.timeout}s; CACHE_TTL={args.cache_ttl}s; DEBUG={args.debug}")
+    print(
+        "[INFO] Transparent proxy up (ASCII-only). "
+        f"Serial: {args.serial} UNIT_ID={UNIT_ID}; "
+        f"TCP: {TCP_BIND}:{args.tcp_port}; TIMEOUT={args.timeout}s; "
+        f"CACHE_TTL={args.cache_ttl}s; DEBUG={args.debug}"
+    )
 
     ser_slave = SeltronExtSlave(args.serial, debug=args.debug)
     ser_slave.start()
@@ -365,3 +438,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
